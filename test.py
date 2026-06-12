@@ -18,6 +18,11 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import pandas as pd
 import tksheet
 
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
 
 # ─── Theme — Light Engineering Dashboard ──────────────────────────────────────
 # Edit only this block to retheme the entire application.
@@ -67,8 +72,24 @@ TBL_HEX_FG  = "#166534"   # Hex search match cell text
 REQUIRED_COLUMNS = {
     "DateTime", "DeltaT", "BlockStatus", "MessageType",
     "Bus", "Rx_cmd", "Tx_cmd", "Tx_status", "Rx_status",
-    "word_count", "datawords",
 }
+
+# Maps the column names found in the real telemetry export to the canonical
+# names used throughout the rest of this application. Tx_cmd is included
+# here purely as a *name* mapping — its filtering behaviour (4-char prefix
+# match) is completely unchanged.
+COLUMN_ALIASES = {
+    "Time":     "DateTime",
+    "Rx_Cmd":   "Rx_cmd",
+    "Tx_Cmd":   "Tx_cmd",
+    "Tx_Status": "Tx_status",
+    "Rx_Status": "Rx_status",
+}
+
+# Name of the column in the raw CSV that holds the 32 space-separated
+# 16-bit hex words (one row = one 1553 message).
+DATA_COLUMN = "Data"
+WORD_COUNT = 32
 
 
 # ─── Data Layer ───────────────────────────────────────────────────────────────
@@ -85,6 +106,7 @@ class DataManager:
     def load(self, path: str) -> None:
         """Load and validate a CSV file. Raises ValueError on bad structure."""
         df = pd.read_csv(path)
+        df = self._normalize_columns(df)
         self._validate(df)
         self.df = df
         self.file_path = path
@@ -121,6 +143,36 @@ class DataManager:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """Make the raw export compatible with the rest of the application.
+
+        - Renames the raw export's column names to the canonical names this
+          application already expects (Tx_cmd filtering behaviour is
+          unaffected — only the column *label* changes, e.g. "Tx_Cmd" ->
+          "Tx_cmd").
+        - Splits the single "Data" column (32 space-separated 16-bit hex
+          words per row, e.g. "0X0  0X67bc  0Xb22e ...") into individual
+          word0..word31 columns, which is the layout the table, hex search,
+          and bit-analysis features all operate on.
+        """
+        df = df.rename(columns={k: v for k, v in COLUMN_ALIASES.items() if k in df.columns})
+
+        if DATA_COLUMN in df.columns:
+            split_words = df[DATA_COLUMN].fillna("").astype(str).str.split()
+
+            for i in range(WORD_COUNT):
+                df[f"word{i}"] = split_words.apply(
+                    lambda toks, i=i: toks[i] if i < len(toks) else ""
+                )
+
+            # Drop the raw combined column now that it has been expanded —
+            # word0..word31 carry the same information in the format every
+            # other feature (hex search, bit analysis, highlighting) expects.
+            df = df.drop(columns=[DATA_COLUMN])
+
+        return df
+
     def _validate(self, df: pd.DataFrame) -> None:
         missing = REQUIRED_COLUMNS - set(df.columns)
         if missing:
@@ -140,13 +192,57 @@ class DataManager:
         return f"{n:.1f} TB"
 
 
+# ─── Hex Normalization Helpers ────────────────────────────────────────────────
+# Accepts any of: 0xA12B, 0XA12B, A12B, a12b, ffff, FFFF
+# and normalizes to a bare, uppercase hex-digit string (no "0x" prefix).
+# All hex-related features (Hex Search, Bit Analysis, Value Conversion,
+# Word Parsing, Highlighting, Validation) route through these helpers so
+# hex handling is fully case-insensitive and prefix-insensitive.
+
+def normalize_hex(raw) -> str:
+    """Strip optional 0x/0X prefix + whitespace, return uppercase hex digits.
+
+    Returns "" for empty / non-hex input (caller decides how to handle that).
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    if s[:2].lower() == "0x":
+        s = s[2:]
+    s = s.strip()
+    if not s:
+        return ""
+    try:
+        int(s, 16)
+    except ValueError:
+        return ""
+    return s.upper()
+
+
+def is_valid_hex_word(raw) -> bool:
+    """True if `raw` normalizes to a non-empty 16-bit hex value."""
+    digits = normalize_hex(raw)
+    if not digits:
+        return False
+    return 0 <= int(digits, 16) <= 0xFFFF
+
+
 # ─── Word Model & Bit Logic ───────────────────────────────────────────────────
 
 class Word:
-    """Represents a single 16-bit word parsed from a hex string."""
+    """Represents a single 16-bit word parsed from a hex string.
+
+    Accepts any hex representation (0xA12B, 0XA12B, A12B, a12b, ffff, FFFF, ...)
+    via normalize_hex().
+    """
 
     def __init__(self, raw: str):
-        self.value = int(raw.strip(), 0)
+        digits = normalize_hex(raw)
+        if not digits:
+            raise ValueError(f"'{raw}' is not a valid hexadecimal value")
+        self.value = int(digits, 16)
         if not 0 <= self.value <= 65535:
             raise ValueError(f"'{raw}' = {self.value} is out of 16-bit range [0, 65535]")
         self.binary  = bin(self.value)[2:].zfill(16)
@@ -1022,6 +1118,171 @@ class FilterOutputPanel(tk.Frame, StyleMixin):
             return -1
 
 
+# ─── GUI: Telemetry Plot Window ───────────────────────────────────────────────
+
+class PlotWindow(tk.Toplevel):
+    """Separate window plotting word0..word31 as integer traces over time.
+
+    - X-axis: 'Serial Number' / 'SerialNumber' / 'SerialNo' column if present
+      in the loaded data, otherwise the DataFrame row index.
+    - Y-axis: integer value of each word column (hex -> int via
+      normalize_hex / Word, case- and prefix-insensitive).
+    - Each word column is an independent trace with its own color and a
+      legend. Pan/zoom is provided by matplotlib's standard navigation
+      toolbar (embedded below the plot).
+    - Missing / invalid / blank word values are skipped (not plotted as 0),
+      so gaps simply break that word's line.
+    """
+
+    WORD_COLS = [f"word{i}" for i in range(32)]
+
+    # X-axis column candidates, in priority order
+    _X_CANDIDATES = ["Serial Number", "SerialNumber", "Serial_Number", "SerialNo"]
+
+    def __init__(self, parent: tk.Tk, df: pd.DataFrame, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.title("Telemetry Plot — word0 .. word31")
+        self.configure(bg=BG)
+        self.geometry("1100x700")
+
+        self._df = df
+        self._build()
+
+    def _build(self) -> None:
+        toolbar_frame = tk.Frame(self, bg=PANEL)
+        toolbar_frame.pack(side="bottom", fill="x")
+
+        fig = Figure(figsize=(10, 6), dpi=100)
+        ax = fig.add_subplot(111)
+
+        present_word_cols = [c for c in self.WORD_COLS if c in self._df.columns]
+
+        if not present_word_cols:
+            ax.text(0.5, 0.5, "No word0..word31 columns available to plot.",
+                    ha="center", va="center", transform=ax.transAxes)
+        else:
+            # Determine X-axis source
+            x_col = next((c for c in self._X_CANDIDATES if c in self._df.columns), None)
+            if x_col is not None:
+                x_values = pd.to_numeric(self._df[x_col], errors="coerce")
+                x_label = x_col
+            else:
+                x_values = pd.Series(self._df.index, index=self._df.index)
+                x_label = "Row Index"
+
+            # Distinct colors across the full word range via a continuous colormap
+            cmap = matplotlib.colormaps["tab20"] if hasattr(matplotlib, "colormaps") \
+                else matplotlib.cm.get_cmap("tab20")
+
+            plotted_any = False
+            for i, col in enumerate(present_word_cols):
+                int_values = self._df[col].apply(self._hex_to_int)
+
+                valid = int_values.notna()
+                if not valid.any():
+                    continue  # entire column is invalid/missing — skip gracefully
+
+                xs = x_values[valid]
+                ys = int_values[valid]
+
+                color = cmap(i / max(1, len(present_word_cols) - 1))
+                ax.plot(xs, ys, label=col, color=color, linewidth=1.0, marker="")
+                plotted_any = True
+
+            if not plotted_any:
+                ax.text(0.5, 0.5, "No valid hex values found in word0..word31.",
+                        ha="center", va="center", transform=ax.transAxes)
+            else:
+                ax.set_xlabel(x_label)
+                ax.set_ylabel("Word Value (decimal)")
+                ax.set_title("Telemetry Words — word0 .. word31")
+                ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+                ax.legend(loc="upper right", fontsize=7, ncol=4)
+
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=self)
+        canvas.draw()
+        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+
+        # Standard matplotlib navigation toolbar — provides pan + zoom + reset
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        toolbar.update()
+
+        # ── FUTURE ANALYTICS (DISABLED) ─────────────────────────────────────
+        # The blocks below are placeholders for future analytics features.
+        # They are intentionally inert (commented out) and must not be
+        # activated as part of this change. Each can be wired up later by
+        # uncommenting and adding the relevant UI controls (e.g. a
+        # checkbox/menu in PlotWindow to toggle each overlay on `ax`).
+        #
+        # --- Moving Average -------------------------------------------------
+        # FUTURE ANALYTICS (DISABLED)
+        # window = 5
+        # for i, col in enumerate(present_word_cols):
+        #     int_values = self._df[col].apply(self._hex_to_int)
+        #     ma = int_values.rolling(window=window, min_periods=1).mean()
+        #     ax.plot(x_values, ma, linestyle="--", linewidth=0.8,
+        #             label=f"{col} (MA{window})")
+        #
+        # --- Anomaly Detection ----------------------------------------------
+        # FUTURE ANALYTICS (DISABLED)
+        # from scipy import stats  # or a simple z-score implementation
+        # for i, col in enumerate(present_word_cols):
+        #     int_values = self._df[col].apply(self._hex_to_int)
+        #     z = (int_values - int_values.mean()) / int_values.std(ddof=0)
+        #     anomalies = int_values[z.abs() > 3]
+        #     ax.scatter(x_values.loc[anomalies.index], anomalies,
+        #                color="red", marker="x", s=20,
+        #                label=f"{col} anomalies")
+        #
+        # --- Threshold Bands -------------------------------------------------
+        # FUTURE ANALYTICS (DISABLED)
+        # lower_threshold, upper_threshold = 1000, 60000
+        # ax.axhspan(lower_threshold, upper_threshold,
+        #            color="green", alpha=0.05, label="Normal band")
+        # ax.axhline(lower_threshold, color="orange", linestyle=":", linewidth=0.8)
+        # ax.axhline(upper_threshold, color="orange", linestyle=":", linewidth=0.8)
+        #
+        # --- Min/Max Highlighting --------------------------------------------
+        # FUTURE ANALYTICS (DISABLED)
+        # for i, col in enumerate(present_word_cols):
+        #     int_values = self._df[col].apply(self._hex_to_int)
+        #     if int_values.notna().any():
+        #         idx_max = int_values.idxmax()
+        #         idx_min = int_values.idxmin()
+        #         ax.annotate("max", (x_values[idx_max], int_values[idx_max]),
+        #                      color="darkred")
+        #         ax.annotate("min", (x_values[idx_min], int_values[idx_min]),
+        #                      color="darkblue")
+        #
+        # --- Word Correlation Analysis ---------------------------------------
+        # FUTURE ANALYTICS (DISABLED)
+        # int_df = pd.DataFrame({
+        #     col: self._df[col].apply(self._hex_to_int) for col in present_word_cols
+        # })
+        # corr_matrix = int_df.corr()
+        # # e.g. render corr_matrix as a heatmap in a separate tab/figure:
+        # # fig2 = Figure(figsize=(8, 8)); ax2 = fig2.add_subplot(111)
+        # # ax2.imshow(corr_matrix, cmap="coolwarm", vmin=-1, vmax=1)
+        # ────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _hex_to_int(raw) -> float:
+        """Convert a word cell to an int value, or NaN if missing/invalid.
+
+        Uses the same case-/prefix-insensitive normalization as every other
+        hex feature in this application (normalize_hex / Word).
+        """
+        digits = normalize_hex(raw)
+        if not digits:
+            return float("nan")
+        value = int(digits, 16)
+        if not 0 <= value <= 0xFFFF:
+            return float("nan")
+        return float(value)
+
+
 # ─── GUI: Main Application ────────────────────────────────────────────────────
 
 class App(tk.Tk, StyleMixin):
@@ -1085,6 +1346,7 @@ class App(tk.Tk, StyleMixin):
             return btn
 
         _topbar_btn("📂  Upload CSV",       self._upload_file,       primary=True).pack(side="right", padx=(4, 0))
+        _topbar_btn("📈  Plot Telemetry",   self._open_plot_window               ).pack(side="right", padx=(4, 0))
         _topbar_btn("💾  Download Display", self._download_display               ).pack(side="right", padx=(4, 0))
         _topbar_btn("✕  Clear Filter",      self._clear_tx_filter               ).pack(side="right", padx=(4, 0))
         _topbar_btn("🔍  Filter Tx_cmd",    self._apply_tx_filter               ).pack(side="right", padx=(4, 0))
@@ -1324,7 +1586,7 @@ class App(tk.Tk, StyleMixin):
         # If a hex search is active, try to populate bit analysis with the
         # first matched word column that has a valid hex value in this row.
         if self._hex_search and self._bit_analysis.winfo_ismapped():
-            target = self._hex_search.upper()
+            target = self._hex_search
             word_set = {f"word{i}" for i in range(32)}
             # Find the first word column whose value matches the search target
             matched_col = None
@@ -1332,16 +1594,16 @@ class App(tk.Tk, StyleMixin):
             for col, val in row_data.items():
                 if col in word_set:
                     val_str = str(val).strip()
-                    if val_str.upper() == target:
+                    if normalize_hex(val_str) == target:
                         matched_col = col
                         matched_val = val_str
                         break
-            # If no exact match in this row, try the first word column with a hex value
+            # If no exact match in this row, try the first word column with a valid hex value
             if matched_col is None:
                 for col, val in row_data.items():
                     if col in word_set:
                         val_str = str(val).strip()
-                        if val_str.lower().startswith("0x"):
+                        if is_valid_hex_word(val_str):
                             matched_col = col
                             matched_val = val_str
                             break
@@ -1398,7 +1660,7 @@ class App(tk.Tk, StyleMixin):
         # Compute hex highlights
         hex_highlights: set[tuple] | None = None
         if self._hex_search:
-            target = self._hex_search.upper()
+            target = self._hex_search
             word_set = {f"word{i}" for i in range(32)}
             searchable_cols = [
                 (ci, col) for ci, col in enumerate(visible_cols_now) if col in word_set
@@ -1407,18 +1669,18 @@ class App(tk.Tk, StyleMixin):
             matched_rows = set()
             for row_i, (_, row_vals) in enumerate(rows):
                 for ci, col in searchable_cols:
-                    if str(row_vals[ci]).strip().upper() == target:
+                    if normalize_hex(row_vals[ci]) == target:
                         hex_highlights.add((row_i, ci))
                         matched_rows.add(row_i)
             # Update search result label
             if hex_highlights:
                 self._search_result_var.set(
-                    f"Search '{self._hex_search}': {len(hex_highlights)} cell(s) in {len(matched_rows)} row(s)"
+                    f"Search '0x{self._hex_search}': {len(hex_highlights)} cell(s) in {len(matched_rows)} row(s)"
                 )
                 self._search_result_label.config(fg=SUCCESS)
                 self._show_bit_analysis()
             else:
-                self._search_result_var.set(f"No matches found for {self._hex_search}")
+                self._search_result_var.set(f"No matches found for 0x{self._hex_search}")
                 self._search_result_label.config(fg=ERROR)
                 self._hide_bit_analysis()
 
@@ -1441,12 +1703,13 @@ class App(tk.Tk, StyleMixin):
         value = value.strip()
         if not value:
             return
-        # Normalise: ensure 0x prefix, uppercase
-        if not value.lower().startswith("0x"):
-            value = "0x" + value
-        self._hex_search = value.upper()
+        normalized = normalize_hex(value)
+        if not normalized:
+            self._status_set(f"'{value}' is not a valid hexadecimal value.", ok=False)
+            return
+        self._hex_search = normalized
         self._refresh_table()
-        self._status_set(f"Hex search for '{self._hex_search}' applied.", ok=True)
+        self._status_set(f"Hex search for '0x{self._hex_search}' applied.", ok=True)
 
     def _clear_hex_search(self) -> None:
         if self._hex_search is None:
@@ -1473,6 +1736,19 @@ class App(tk.Tk, StyleMixin):
             self._status_set(f"Exported {len(self._display_df)} rows → '{os.path.basename(path)}'.", ok=True)
         except Exception as exc:
             self._status_set(f"Export failed: {exc}", ok=False)
+
+    def _open_plot_window(self) -> None:
+        """Open the matplotlib telemetry plot window for word0..word31.
+
+        Plots the full loaded dataset (independent of the current Tx_cmd
+        filter / hex search / word-column visibility selections), so the
+        existing table-centric workflows are left untouched.
+        """
+        if self._data.df is None:
+            self._status_set("Load a CSV file first.", ok=False)
+            return
+        PlotWindow(self, self._data.df)
+        self._status_set("Opened telemetry plot window.", ok=True)
 
     def _apply_word_cols(self) -> None:
         if self._data.df is None:
