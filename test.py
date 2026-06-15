@@ -1300,7 +1300,34 @@ class App(tk.Tk, StyleMixin):
         self._hex_search: str | None = None
         self._display_df: pd.DataFrame | None = None
         self._last_selected_word_col: str | None = None   # word col of last selected row
+        self._display_format = tk.StringVar(value="Hexadecimal")
         self._build_ui()
+
+    # ── Display Format Helper ─────────────────────────────────────────────────
+
+    def _format_word_display(self, value) -> str:
+        """Convert a raw word cell value to the currently selected display format.
+
+        Only called at display time — never modifies self._data.df.
+        Falls back to the original string on any parse failure.
+        """
+        fmt = self._display_format.get().lower()
+        if fmt == "hexadecimal":
+            return str(value)   # already stored as hex; no conversion needed
+        digits = normalize_hex(value)
+        if not digits:
+            return str(value)   # invalid / empty — show original unchanged
+        try:
+            w = Word(value)
+        except Exception:
+            return str(value)
+        if fmt == "binary":
+            return f"0b{w.binary}"
+        if fmt == "integer":
+            return str(w.decimal)
+        if fmt == "octal":
+            return w.octal
+        return str(value)
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
@@ -1391,6 +1418,28 @@ class App(tk.Tk, StyleMixin):
 
         self._btn(bar, "Apply Columns", self._apply_word_cols, small=True).pack(side="left", padx=(8, 4))
         self._btn(bar, "Reset Columns", self._reset_word_cols, small=True).pack(side="left", padx=(0, 4))
+
+        # ── Display Format dropdown ──────────────────────────────────────────
+        tk.Frame(bar, bg=BORDER, width=1).pack(side="left", fill="y", padx=(10, 8), pady=2)
+
+        tk.Label(bar, text="DISPLAY FORMAT:", font=(SANS, 8, "bold"),
+                 bg=PANEL, fg=MUTED).pack(side="left", padx=(0, 4))
+
+        fmt_om = tk.OptionMenu(
+            bar, self._display_format,
+            "Hexadecimal", "Binary", "Integer", "Octal",
+            command=lambda _: self._refresh_table(),
+        )
+        fmt_om.config(
+            font=(MONO, 8), bg=BTN_SECONDARY, fg=BTN_SECONDARY_FG,
+            activebackground=ACCENT2, activeforeground=BTN_FG,
+            relief="flat", bd=0, highlightthickness=0, width=11,
+        )
+        fmt_om["menu"].config(
+            font=(MONO, 8), bg=PANEL, fg=TEXT,
+            activebackground=ACCENT2, activeforeground=BTN_FG,
+        )
+        fmt_om.pack(side="left")
 
     def _build_main_area(self) -> None:
         """Horizontal pane: table (left, expandable) + detail panel (right, fixed)."""
@@ -1685,6 +1734,21 @@ class App(tk.Tk, StyleMixin):
                 self._hide_bit_analysis()
 
         self._display_df = display_df
+
+        # Apply word-column display formatting (display layer only — df untouched)
+        word_set = {f"word{i}" for i in range(32)}
+        fmt = self._display_format.get().lower()
+        if fmt != "hexadecimal":
+            word_col_indices = {
+                ci for ci, col in enumerate(visible_cols_now) if col in word_set
+            }
+            formatted_rows = []
+            for orig_idx, row_vals in rows:
+                row_list = list(row_vals)
+                for ci in word_col_indices:
+                    row_list[ci] = self._format_word_display(row_list[ci])
+                formatted_rows.append((orig_idx, tuple(row_list)))
+            rows = formatted_rows
 
         self._table.populate(rows, tx_filter=self._tx_filter, hex_highlights=hex_highlights)
 
