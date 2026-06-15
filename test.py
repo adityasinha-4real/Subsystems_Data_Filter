@@ -860,7 +860,7 @@ class BitAnalysisPanel(tk.Frame, StyleMixin):
 
 class FilterOutputPanel(tk.Frame, StyleMixin):
     """
-    Collapsible panel showing the comWord_Filtered folder hierarchy.
+    Collapsible panel showing the SubSys_comWordFiltered folder hierarchy.
     Always present in the layout; collapses/expands via the header chevron.
     Refreshed from the background export thread via the public `refresh` method
     (must be called on the Tkinter main thread via `app.after(0, ...)`).
@@ -898,7 +898,7 @@ class FilterOutputPanel(tk.Frame, StyleMixin):
             command=self._toggle_collapse,
         ).pack(side="left", padx=(0, 6))
 
-        tk.Label(hdr, text="📁  COMWORD FILTERED OUTPUT",
+        tk.Label(hdr, text="📁  SUBSYSTEM FILTERED OUTPUT",
                  font=(SANS, 10, "bold"), bg=PANEL, fg=ACCENT2).pack(side="left")
 
         # Stats strip (right side of header)
@@ -993,7 +993,8 @@ class FilterOutputPanel(tk.Frame, StyleMixin):
     def refresh(self, root_path: str, identifiers: list[str]) -> None:
         """
         Rebuild the tree from the export results.
-        `identifiers` — list of valid 4-char subsystem IDs that were written.
+        `identifiers` — list of valid 4-char subsystem IDs that were written
+        (already sorted alphabetically by the export thread).
         Must be called on the Tkinter main thread.
         """
         self._root_path = root_path
@@ -1012,7 +1013,7 @@ class FilterOutputPanel(tk.Frame, StyleMixin):
         # Root node
         root_iid = self._tree.insert(
             "", "end",
-            text=f"  📁  comWord_Filtered",
+            text=f"  📁  SubSys_comWordFiltered",
             values=("",),
             open=True,
             tags=("root",),
@@ -1020,12 +1021,15 @@ class FilterOutputPanel(tk.Frame, StyleMixin):
         self._iid_to_path[root_iid] = root_path
         self._tree.tag_configure("root", foreground=ACCENT)
 
+        # identifiers already sorted alphabetically by the export thread;
+        # map them to SS1, SS2, SS3, ... in that same order.
         sorted_ids = sorted(identifiers)
         for i, ident in enumerate(sorted_ids):
-            is_last = (i == len(sorted_ids) - 1)
-            branch = "└──" if is_last else "├──"
-            sub_dir  = os.path.join(root_path, ident)
-            csv_file = os.path.join(sub_dir, f"filtered_{ident}.csv")
+            ss_name  = f"SS{i + 1}"
+            is_last  = (i == len(sorted_ids) - 1)
+            branch   = "└──" if is_last else "├──"
+            sub_dir  = os.path.join(root_path, ss_name)
+            csv_file = os.path.join(sub_dir, f"filtered_{ss_name}.csv")
 
             # Count rows (header excluded)
             row_count = self._count_rows(csv_file)
@@ -1034,7 +1038,7 @@ class FilterOutputPanel(tk.Frame, StyleMixin):
             # Subsystem folder node
             folder_iid = self._tree.insert(
                 root_iid, "end",
-                text=f"  {branch} 📂  {ident}",
+                text=f"  {branch} 📂  {ss_name}",
                 values=("",),
                 open=True,
                 tags=("folder",),
@@ -1046,7 +1050,7 @@ class FilterOutputPanel(tk.Frame, StyleMixin):
             sub_branch = "    └──" if is_last else "│   └──"
             file_iid = self._tree.insert(
                 folder_iid, "end",
-                text=f"  {sub_branch} 🗒  filtered_{ident}.csv",
+                text=f"  {sub_branch} 🗒  filtered_{ss_name}.csv",
                 values=(row_label,),
                 tags=("csvfile",),
             )
@@ -1573,12 +1577,14 @@ class App(tk.Tk, StyleMixin):
 
     def _export_filtered_by_subsystem(self, csv_path: str, df: pd.DataFrame) -> None:
         """
-        Background thread: create comWord_Filtered/<ID>/filtered_<ID>.csv
+        Background thread: create SubSys_comWordFiltered/SSn/filtered_SSn.csv
         for each unique 4-character Tx_cmd prefix found in the loaded CSV.
+        Subsystem identifiers are sorted alphabetically; the first maps to SS1,
+        the second to SS2, and so on (deterministic, stable ordering).
         Safe to run off the main thread — only touches the filesystem.
         """
         try:
-            out_root = os.path.join(os.path.dirname(csv_path), "comWord_Filtered")
+            out_root = os.path.join(os.path.dirname(csv_path), "SubSys_comWordFiltered")
             os.makedirs(out_root, exist_ok=True)
 
             # Extract valid 4-char identifiers (skip null / short values)
@@ -1590,19 +1596,23 @@ class App(tk.Tk, StyleMixin):
                 .unique()
             )
 
-            valid_ids: list[str] = []
-            for ident in identifiers:
-                # Skip nan/empty artefacts
-                if not ident or ident.upper() == "NAN":
-                    continue
+            # Sort alphabetically for deterministic SS1/SS2/... mapping
+            sorted_ids = sorted(
+                ident for ident in identifiers
+                if ident and ident.upper() != "NAN"
+            )
 
-                sub_dir = os.path.join(out_root, ident)
+            valid_ids: list[str] = []
+            for i, ident in enumerate(sorted_ids):
+                ss_name = f"SS{i + 1}"
+
+                sub_dir = os.path.join(out_root, ss_name)
                 os.makedirs(sub_dir, exist_ok=True)
 
                 mask = tx_series.str[:4].str.upper() == ident
                 filtered = df.loc[mask]
 
-                out_file = os.path.join(sub_dir, f"filtered_{ident}.csv")
+                out_file = os.path.join(sub_dir, f"filtered_{ss_name}.csv")
                 filtered.to_csv(out_file, index=False)
                 valid_ids.append(ident)
 
@@ -1612,7 +1622,7 @@ class App(tk.Tk, StyleMixin):
                 0,
                 lambda r=out_root, ids=valid_ids, count=n: (
                     self._status_set(
-                        f"comWord_Filtered: {count} subsystem folder(s) written alongside the CSV.", ok=True
+                        f"SubSys_comWordFiltered: {count} subsystem folder(s) written alongside the CSV.", ok=True
                     ),
                     self._filter_output.refresh(r, ids),
                     self._set_badge(self._badge_exp, "● EXPORT DONE", BADGE_EXP_BG, BADGE_EXP_FG),
@@ -1623,7 +1633,7 @@ class App(tk.Tk, StyleMixin):
             self.after(
                 0,
                 lambda e=exc: self._status_set(
-                    f"comWord_Filtered export failed: {e}", ok=False
+                    f"SubSys_comWordFiltered export failed: {e}", ok=False
                 ),
             )
 
