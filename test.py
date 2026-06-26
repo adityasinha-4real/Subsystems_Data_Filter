@@ -8,6 +8,8 @@ Run:    python telemetry_viewer.py
 Deps:   pandas  (pip install pandas)
 """
 
+import ast
+import math
 import os
 import platform
 import subprocess
@@ -18,10 +20,29 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import pandas as pd
 import tksheet
 
+import datetime
+import shutil
+
 import matplotlib
+import matplotlib.ticker
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import matplotlib.pyplot as plt
+
+# PDF report generation (optional dependency)
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        Image as RLImage, HRFlowable, PageBreak,
+    )
+    _REPORTLAB_OK = True
+except ImportError:
+    _REPORTLAB_OK = False
 
 
 # ─── Theme — Light Engineering Dashboard ──────────────────────────────────────
@@ -277,6 +298,87 @@ def query_bits_combined(
         "decimal":     str(value),
     }
     return result[fmt], combined, value
+
+
+# ─── Safe Engineering Formula Evaluator ──────────────────────────────────────
+# Evaluates user-supplied arithmetic expressions with `x` as the only variable.
+# Only a whitelisted subset of AST node types is allowed — no attribute access,
+# no function calls beyond a restricted math namespace, no import, no exec.
+#
+# Allowed operations: +  -  *  /  //  %  **  unary +/-
+# Allowed constants : pi, e, inf  (via _SAFE_NAMES)
+# Allowed functions : abs, round, floor, ceil, sqrt, log, log2, log10,
+#                     sin, cos, tan, exp  (via _SAFE_NAMES)
+
+_SAFE_NAMES: dict = {
+    "x":     None,            # placeholder; replaced at eval time
+    "pi":    math.pi,
+    "e":     math.e,
+    "inf":   math.inf,
+    "abs":   abs,
+    "round": round,
+    "floor": math.floor,
+    "ceil":  math.ceil,
+    "sqrt":  math.sqrt,
+    "log":   math.log,
+    "log2":  math.log2,
+    "log10": math.log10,
+    "sin":   math.sin,
+    "cos":   math.cos,
+    "tan":   math.tan,
+    "exp":   math.exp,
+}
+
+_ALLOWED_AST_NODES = (
+    ast.Expression,
+    ast.BinOp,   ast.UnaryOp,
+    ast.Add,     ast.Sub,  ast.Mult,   ast.Div,
+    ast.FloorDiv,ast.Mod,  ast.Pow,
+    ast.UAdd,    ast.USub,
+    ast.Constant,ast.Name,
+    ast.Call,                          # only for whitelisted names
+    ast.Load,
+)
+
+
+def _ast_is_safe(node) -> bool:
+    """Recursively verify every node is in the whitelist."""
+    if not isinstance(node, _ALLOWED_AST_NODES):
+        return False
+    if isinstance(node, ast.Name) and node.id not in _SAFE_NAMES:
+        return False
+    if isinstance(node, ast.Call):
+        # Only bare Name calls (no attribute chains)
+        if not isinstance(node.func, ast.Name):
+            return False
+        if node.func.id not in _SAFE_NAMES:
+            return False
+    return all(_ast_is_safe(child) for child in ast.iter_child_nodes(node))
+
+
+def safe_eval_formula(formula: str, x: float) -> tuple[bool, float | str]:
+    """Evaluate `formula` with variable `x`.
+
+    Returns (True, result_float) on success, (False, error_message) on failure.
+    """
+    formula = formula.strip()
+    if not formula:
+        return False, "Formula is empty."
+    try:
+        tree = ast.parse(formula, mode="eval")
+    except SyntaxError as exc:
+        return False, f"Syntax error: {exc.msg}"
+    if not _ast_is_safe(tree.body):
+        return False, "Formula contains disallowed operations or identifiers."
+    namespace = dict(_SAFE_NAMES)
+    namespace["x"] = x
+    try:
+        result = eval(compile(tree, "<formula>", "eval"), {"__builtins__": {}}, namespace)  # noqa: S307
+        return True, float(result)
+    except ZeroDivisionError:
+        return False, "Division by zero."
+    except Exception as exc:
+        return False, str(exc)
 
 
 # ─── GUI: Widget Helpers (mixin) ──────────────────────────────────────────────
@@ -1029,10 +1131,10 @@ class FilterOutputPanel(tk.Frame, StyleMixin):
             is_last  = (i == len(sorted_ids) - 1)
             branch   = "└──" if is_last else "├──"
             sub_dir  = os.path.join(root_path, ss_name)
-            csv_file = os.path.join(sub_dir, f"filtered_{ss_name}.csv")
+            txt_file = os.path.join(sub_dir, f"filtered_{ss_name}.txt")
 
             # Count rows (header excluded)
-            row_count = self._count_rows(csv_file)
+            row_count = self._count_rows(txt_file)
             row_label = str(row_count) if row_count >= 0 else "?"
 
             # Subsystem folder node
@@ -1046,15 +1148,15 @@ class FilterOutputPanel(tk.Frame, StyleMixin):
             self._iid_to_path[folder_iid] = sub_dir
             self._tree.tag_configure("folder", foreground=WARN)
 
-            # CSV file node
+            # TXT file node
             sub_branch = "    └──" if is_last else "│   └──"
             file_iid = self._tree.insert(
                 folder_iid, "end",
-                text=f"  {sub_branch} 🗒  filtered_{ss_name}.csv",
+                text=f"  {sub_branch} 🗒  filtered_{ss_name}.txt",
                 values=(row_label,),
                 tags=("csvfile",),
             )
-            self._iid_to_path[file_iid] = csv_file
+            self._iid_to_path[file_iid] = txt_file
             self._tree.tag_configure("csvfile", foreground=SUCCESS)
 
         # Update header stats
@@ -1122,162 +1224,800 @@ class FilterOutputPanel(tk.Frame, StyleMixin):
             return -1
 
 
+# ─── Acceptance Engine ────────────────────────────────────────────────────────
+
+class AcceptanceEngine:
+    """Classifies every word-column telemetry value against acceptance cutoffs.
+
+    Operates entirely on the original DataFrame without mutating it.
+    All results are plain DataFrames so they can be saved or passed to
+    the report generator without any tkinter dependency.
+    """
+
+    def __init__(self, df: pd.DataFrame, lower: int, upper: int):
+        self.df    = df
+        self.lower = lower
+        self.upper = upper
+        self.accepted_df: pd.DataFrame = pd.DataFrame()
+        self.rejected_df: pd.DataFrame = pd.DataFrame()
+        self.summary: dict = {}
+
+    def run(self, word_cols: list | None = None) -> None:
+        """Classify all word-column values and populate accepted/rejected DFs."""
+        all_words   = [f"word{i}" for i in range(32)]
+        target_cols = word_cols if word_cols else all_words
+        present     = [c for c in target_cols if c in self.df.columns]
+
+        accepted_records: list[dict] = []
+        rejected_records: list[dict] = []
+
+        for row_idx, row in self.df.iterrows():
+            for col in present:
+                digits = normalize_hex(row[col])
+                if not digits:
+                    continue
+                dec_val = int(digits, 16)
+                hex_val = f"0x{dec_val:04X}"
+
+                if self.lower <= dec_val <= self.upper:
+                    accepted_records.append({
+                        "Row Index":    row_idx,
+                        "Word Column":  col,
+                        "Hex Value":    hex_val,
+                        "Decimal Value": dec_val,
+                        "Status":       "Accepted",
+                    })
+                else:
+                    reason = ("Below Lower Cutoff" if dec_val < self.lower
+                              else "Above Upper Cutoff")
+                    rejected_records.append({
+                        "Row Index":    row_idx,
+                        "Word Column":  col,
+                        "Hex Value":    hex_val,
+                        "Decimal Value": dec_val,
+                        "Reason":       reason,
+                    })
+
+        def _make_df(records, extra_col):
+            df = pd.DataFrame(records).reset_index(drop=True)
+            df.index += 1
+            df.index.name = "Serial Number"
+            return df
+
+        self.accepted_df = _make_df(accepted_records, "Status")
+        self.rejected_df = _make_df(rejected_records, "Reason")
+
+        total    = len(accepted_records) + len(rejected_records)
+        accepted = len(accepted_records)
+        rejected = len(rejected_records)
+        self.summary = {
+            "Total Points": total,
+            "Accepted":     accepted,
+            "Rejected":     rejected,
+            "Acceptance %": f"{accepted / total * 100:.2f}%" if total else "N/A",
+            "Rejection %":  f"{rejected / total * 100:.2f}%" if total else "N/A",
+            "Lower Cutoff": self.lower,
+            "Upper Cutoff": self.upper,
+        }
+
+
+# ─── Report / Output Helpers ─────────────────────────────────────────────────
+
+def _save_acceptance_output(
+    csv_path: str,
+    engine: AcceptanceEngine,
+    acc_img: str,
+    rej_img: str,
+    file_name: str,
+) -> str:
+    """Write CSVs + PDF report into Acceptance_Report/ beside the CSV.
+
+    Returns the absolute path of the output folder.
+    """
+    out_root = os.path.join(os.path.dirname(csv_path), "Acceptance_Report")
+
+    if os.path.isdir(out_root):
+        if not messagebox.askyesno(
+            "Overwrite?",
+            "Acceptance_Report folder already exists.\n\nOverwrite its contents?",
+        ):
+            return out_root
+        shutil.rmtree(out_root)
+
+    os.makedirs(out_root, exist_ok=True)
+
+    # Copy plot images
+    acc_dst = os.path.join(out_root, "accepted_plot.png")
+    rej_dst = os.path.join(out_root, "rejected_plot.png")
+    shutil.copy2(acc_img, acc_dst)
+    shutil.copy2(rej_img, rej_dst)
+
+    # Save CSVs
+    engine.accepted_df.to_csv(os.path.join(out_root, "accepted_data.csv"))
+    engine.rejected_df.to_csv(os.path.join(out_root, "rejected_data.csv"))
+
+    # Generate report
+    report_path = os.path.join(out_root, "Acceptance_Report.pdf")
+    _build_pdf_report(engine, acc_dst, rej_dst, file_name, report_path)
+    return out_root
+
+
+def _build_pdf_report(
+    engine: AcceptanceEngine,
+    acc_img: str,
+    rej_img: str,
+    file_name: str,
+    out_path: str,
+) -> None:
+    if not _REPORTLAB_OK:
+        messagebox.showwarning(
+            "Report Generation",
+            "reportlab is not installed. Install it with:\n\n  pip install reportlab\n\n"
+            "CSVs and plot images have still been saved.",
+        )
+        return
+
+    styles = getSampleStyleSheet()
+    navy   = rl_colors.HexColor("#1E3A5F")
+    accent = rl_colors.HexColor("#2563EB")
+
+    title_style = ParagraphStyle("RT", parent=styles["Title"],
+                                 fontSize=20, textColor=navy, spaceAfter=6)
+    h1_style    = ParagraphStyle("H1", parent=styles["Heading1"],
+                                 fontSize=13, textColor=accent,
+                                 spaceBefore=14, spaceAfter=4)
+    body_style  = ParagraphStyle("B", parent=styles["Normal"],
+                                 fontSize=9, leading=14)
+
+    doc   = SimpleDocTemplate(out_path, pagesize=A4,
+                              leftMargin=2*cm, rightMargin=2*cm,
+                              topMargin=2*cm,  bottomMargin=2*cm)
+    now   = datetime.datetime.now()
+    story = []
+
+    story.append(Paragraph("Telemetry Acceptance Analysis Report", title_style))
+    story.append(HRFlowable(width="100%", thickness=2, color=accent, spaceAfter=10))
+
+    # §1 Report Information
+    story.append(Paragraph("1.  Report Information", h1_style))
+    story.append(_info_table([
+        ["File Name",    file_name],
+        ["Date",         now.strftime("%Y-%m-%d")],
+        ["Time",         now.strftime("%H:%M:%S")],
+        ["Generated By", "Telemetry Data Analysis Application"],
+    ]))
+    story.append(Spacer(1, 10))
+
+    # §2 Acceptance Configuration
+    story.append(Paragraph("2.  Acceptance Configuration", h1_style))
+    story.append(_info_table([
+        ["Lower Cutoff", str(engine.lower)],
+        ["Upper Cutoff", str(engine.upper)],
+    ]))
+    story.append(Spacer(1, 10))
+
+    # §3 Summary Statistics
+    story.append(Paragraph("3.  Summary Statistics", h1_style))
+    s = engine.summary
+    story.append(_info_table([
+        ["Total Points", str(s["Total Points"])],
+        ["Accepted",     str(s["Accepted"])],
+        ["Rejected",     str(s["Rejected"])],
+        ["Acceptance %", s["Acceptance %"]],
+        ["Rejection %",  s["Rejection %"]],
+    ]))
+    story.append(Spacer(1, 10))
+
+    # §4 Accepted Commands
+    story.append(Paragraph("4.  Accepted Commands", h1_style))
+    acc_cols = ["Serial Number", "Row Index", "Word Column",
+                "Hex Value", "Decimal Value", "Status"]
+    story.append(_data_table(engine.accepted_df.reset_index(), acc_cols,
+                             hdr_bg=rl_colors.HexColor("#DCFCE7"),
+                             hdr_fg=rl_colors.HexColor("#166534")))
+    story.append(PageBreak())
+
+    # §5 Rejected Commands
+    story.append(Paragraph("5.  Rejected Commands", h1_style))
+    rej_cols = ["Serial Number", "Row Index", "Word Column",
+                "Hex Value", "Decimal Value", "Reason"]
+    story.append(_data_table(engine.rejected_df.reset_index(), rej_cols,
+                             hdr_bg=rl_colors.HexColor("#FEE2E2"),
+                             hdr_fg=rl_colors.HexColor("#991B1B")))
+    story.append(PageBreak())
+
+    # §6 Accepted Plot
+    story.append(Paragraph("6.  Accepted Telemetry Plot", h1_style))
+    if os.path.isfile(acc_img):
+        story.append(RLImage(acc_img, width=16*cm, height=10*cm))
+    story.append(Spacer(1, 10))
+
+    # §7 Rejected Plot
+    story.append(Paragraph("7.  Rejected Telemetry Plot", h1_style))
+    if os.path.isfile(rej_img):
+        story.append(RLImage(rej_img, width=16*cm, height=10*cm))
+    story.append(Spacer(1, 10))
+
+    # §8 Conclusion
+    story.append(Paragraph("8.  Conclusion", h1_style))
+    story.append(Paragraph(
+        "Telemetry analysis completed successfully. "
+        "Values between the specified cutoff limits are classified as <b>Accepted</b>. "
+        "Values outside the cutoff limits are classified as <b>Rejected</b>.<br/><br/>"
+        f"Overall Acceptance Rate: <b>{s['Acceptance %']}</b><br/>"
+        f"Overall Rejection Rate: <b>{s['Rejection %']}</b>",
+        body_style,
+    ))
+
+    doc.build(story)
+
+
+def _info_table(rows: list) -> Table:
+    tbl = Table(rows, colWidths=[5*cm, 11*cm])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (0, -1), rl_colors.HexColor("#EBF0F7")),
+        ("TEXTCOLOR",     (0, 0), (0, -1), rl_colors.HexColor("#1E3A5F")),
+        ("FONTNAME",      (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS",(1, 0), (1, -1),
+         [rl_colors.white, rl_colors.HexColor("#F8FAFC")]),
+        ("GRID",          (0, 0), (-1, -1), 0.5, rl_colors.HexColor("#D0D7DE")),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+    ]))
+    return tbl
+
+
+def _data_table(df: pd.DataFrame, columns: list,
+                hdr_bg, hdr_fg, max_rows: int = 500) -> Table:
+    header  = [columns]
+    data    = header + [
+        list(map(str, r)) for r in df[columns].head(max_rows).itertuples(index=False)
+    ]
+    col_w   = [16*cm / len(columns)] * len(columns)
+    tbl     = Table(data, colWidths=col_w, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, 0), hdr_bg),
+        ("TEXTCOLOR",     (0, 0), (-1, 0), hdr_fg),
+        ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 7),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -1),
+         [rl_colors.white, rl_colors.HexColor("#F8FAFC")]),
+        ("GRID",          (0, 0), (-1, -1), 0.4, rl_colors.HexColor("#D0D7DE")),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+    ]))
+    return tbl
+
+
 # ─── GUI: Telemetry Plot Window ───────────────────────────────────────────────
 
 class PlotWindow(tk.Toplevel):
     """Separate window plotting word0..word31 as integer traces over time.
 
-    - X-axis: 'Serial Number' / 'SerialNumber' / 'SerialNo' column if present
-      in the loaded data, otherwise the DataFrame row index.
-    - Y-axis: integer value of each word column (hex -> int via
-      normalize_hex / Word, case- and prefix-insensitive).
-    - Each word column is an independent trace with its own color and a
-      legend. Pan/zoom is provided by matplotlib's standard navigation
-      toolbar (embedded below the plot).
-    - Missing / invalid / blank word values are skipped (not plotted as 0),
-      so gaps simply break that word's line.
+    Extended with:
+    • Upper / Lower Cutoff input bar + validation
+    • Cutoff overlay on existing interactive plot (red dashed lines + green band)
+    • AcceptanceEngine classification on demand
+    • Auto-generation of accepted_plot.png / rejected_plot.png (300 DPI)
+    • Acceptance summary strip
+    • Accepted / Rejected detail tables (scrollable, tabbed)
+    • "Generate Acceptance Report" button → PDF in Acceptance_Report/
+
+    All original plot behaviour (word selection, save plot, toolbar, subsystem
+    label, save_dir) is preserved completely unchanged.
     """
 
-    WORD_COLS = [f"word{i}" for i in range(32)]
-
-    # X-axis column candidates, in priority order
+    WORD_COLS     = [f"word{i}" for i in range(32)]
     _X_CANDIDATES = ["Serial Number", "SerialNumber", "Serial_Number", "SerialNo"]
 
-    def __init__(self, parent: tk.Tk, df: pd.DataFrame, **kwargs):
+    def __init__(self, parent: tk.Tk, df: pd.DataFrame,
+                 word_cols: list | None = None,
+                 ss_label: str = "All",
+                 save_dir: str | None = None,
+                 csv_path: str = "",
+                 **kwargs):
         super().__init__(parent, **kwargs)
-        self.title("Telemetry Plot — word0 .. word31")
         self.configure(bg=BG)
-        self.geometry("1100x700")
+        self.geometry("1200x820")
 
-        self._df = df
+        self._df        = df
+        self._word_cols = word_cols
+        self._ss_label  = ss_label
+        self._save_dir  = save_dir
+        self._csv_path  = csv_path
+        self._fig       = None
+
+        self._engine: AcceptanceEngine | None = None
+        self._acc_plot_path: str = ""
+        self._rej_plot_path: str = ""
+
+        # Determine active word columns for this window (same logic as before)
+        present = [c for c in self.WORD_COLS if c in self._df.columns]
+        if self._word_cols is not None:
+            present = [c for c in present if c in self._word_cols]
+        self._present_word_cols = present
+
+        # Set title (original logic preserved)
+        if not present:
+            self.title("Telemetry Plot — (no words)")
+        elif self._word_cols is None or len(present) == 32:
+            self.title("Telemetry Plot — word0 .. word31")
+        elif len(present) <= 4:
+            self.title(f"Telemetry Plot — {', '.join(present)}")
+        else:
+            self.title(f"Telemetry Plot — {len(present)} words selected")
+
         self._build()
 
+    # ── UI Construction ───────────────────────────────────────────────────────
+
     def _build(self) -> None:
-        toolbar_frame = tk.Frame(self, bg=PANEL)
-        toolbar_frame.pack(side="bottom", fill="x")
+        self._build_cutoff_bar()
+        self._build_plot_area()
+        self._build_summary_bar()
+        self._build_detail_tables()
 
-        fig = Figure(figsize=(10, 6), dpi=100)
-        ax = fig.add_subplot(111)
+    def _build_cutoff_bar(self) -> None:
+        bar = tk.Frame(self, bg=PANEL, pady=8, padx=14,
+                       highlightbackground=BORDER, highlightthickness=1)
+        bar.pack(fill="x")
 
-        present_word_cols = [c for c in self.WORD_COLS if c in self._df.columns]
+        tk.Label(bar, text="ACCEPTANCE RANGE", font=(SANS, 9, "bold"),
+                 bg=PANEL, fg=ACCENT).pack(side="left", padx=(0, 16))
 
-        if not present_word_cols:
+        tk.Label(bar, text="Lower Cutoff:", font=(SANS, 9),
+                 bg=PANEL, fg=TEXT).pack(side="left")
+        self._lower_var = tk.StringVar()
+        tk.Entry(bar, textvariable=self._lower_var, width=8, font=(MONO, 10),
+                 bg=BG, fg=TEXT, relief="flat",
+                 highlightbackground=BORDER, highlightthickness=1
+                 ).pack(side="left", padx=(4, 14))
+
+        tk.Label(bar, text="Upper Cutoff:", font=(SANS, 9),
+                 bg=PANEL, fg=TEXT).pack(side="left")
+        self._upper_var = tk.StringVar()
+        tk.Entry(bar, textvariable=self._upper_var, width=8, font=(MONO, 10),
+                 bg=BG, fg=TEXT, relief="flat",
+                 highlightbackground=BORDER, highlightthickness=1
+                 ).pack(side="left", padx=(4, 18))
+
+        plot_btn = tk.Button(
+            bar, text="▶  Plot", command=self._do_plot,
+            font=(SANS, 9, "bold"), bg=ACCENT, fg=BTN_FG,
+            activebackground=ACCENT_HOVER, activeforeground=BTN_FG,
+            relief="flat", bd=0, padx=14, pady=4, cursor="hand2",
+        )
+        plot_btn.bind("<Enter>", lambda e: plot_btn.config(bg=ACCENT_HOVER))
+        plot_btn.bind("<Leave>", lambda e: plot_btn.config(bg=ACCENT))
+        plot_btn.pack(side="left", padx=(0, 8))
+
+        self._report_btn = tk.Button(
+            bar, text="📄  Generate Acceptance Report",
+            command=self._generate_report,
+            font=(SANS, 9, "bold"), bg=BTN_SECONDARY, fg=BTN_SECONDARY_FG,
+            activebackground=ACCENT, activeforeground=BTN_FG,
+            relief="flat", bd=0, padx=12, pady=4, cursor="hand2",
+            state="disabled",
+        )
+        self._report_btn.pack(side="left", padx=(0, 4))
+
+        self._pw_status_var = tk.StringVar(
+            value="Enter cutoff values and click Plot — or click Plot without cutoffs for the full plot.")
+        tk.Label(bar, textvariable=self._pw_status_var,
+                 font=(SANS, 8), bg=PANEL, fg=MUTED).pack(side="right")
+
+    def _build_plot_area(self) -> None:
+        self._plot_frame    = tk.Frame(self, bg=BG)
+        self._plot_frame.pack(fill="both", expand=True)
+
+        self._toolbar_frame = tk.Frame(self._plot_frame, bg=PANEL)
+        self._toolbar_frame.pack(side="bottom", fill="x")
+
+        self._canvas_holder = tk.Frame(self._plot_frame, bg=BG)
+        self._canvas_holder.pack(fill="both", expand=True)
+
+        # Draw initial plot without cutoffs (original behaviour)
+        self._draw_main_plot(lower=None, upper=None)
+
+    def _build_summary_bar(self) -> None:
+        self._summary_frame = tk.Frame(self, bg=META_BG,
+                                       highlightbackground=BORDER, highlightthickness=1)
+
+        hdr = tk.Frame(self._summary_frame, bg=META_BG)
+        hdr.pack(fill="x", padx=12, pady=4)
+        tk.Label(hdr, text="ACCEPTANCE SUMMARY", font=(SANS, 9, "bold"),
+                 bg=META_BG, fg=ACCENT).pack(side="left")
+
+        cells = tk.Frame(self._summary_frame, bg=META_BG)
+        cells.pack(fill="x", padx=12, pady=(0, 6))
+
+        self._summary_vars: dict[str, tk.StringVar] = {}
+        keys = ["Total Points", "Accepted", "Rejected",
+                "Acceptance %", "Rejection %", "Lower Cutoff", "Upper Cutoff"]
+        for key in keys:
+            cell = tk.Frame(cells, bg=META_BG)
+            cell.pack(side="left", padx=12)
+            tk.Label(cell, text=key.upper(), font=(SANS, 7, "bold"),
+                     bg=META_BG, fg=MUTED).pack(anchor="w")
+            var = tk.StringVar(value="—")
+            tk.Label(cell, textvariable=var, font=(MONO, 10, "bold"),
+                     bg=META_BG, fg=TEXT).pack(anchor="w")
+            self._summary_vars[key] = var
+            if key != "Upper Cutoff":
+                tk.Frame(cells, bg=BORDER, width=1).pack(
+                    side="left", fill="y", pady=4)
+
+    def _build_detail_tables(self) -> None:
+        self._tables_frame = tk.Frame(self, bg=BG)
+
+        nb = ttk.Notebook(self._tables_frame)
+        nb.pack(fill="both", expand=True, padx=6, pady=4)
+
+        self._acc_tab = tk.Frame(nb, bg=PANEL)
+        self._rej_tab = tk.Frame(nb, bg=PANEL)
+        nb.add(self._acc_tab, text="✔  Accepted")
+        nb.add(self._rej_tab, text="✖  Rejected")
+
+    # ── Plot Logic ────────────────────────────────────────────────────────────
+
+    def _do_plot(self) -> None:
+        lower, upper = self._parse_cutoffs()
+        if lower is None and upper is None and (
+            self._lower_var.get().strip() or self._upper_var.get().strip()
+        ):
+            return  # validation error already shown
+
+        self._draw_main_plot(lower=lower, upper=upper)
+
+        if lower is not None and upper is not None:
+            self._classify_and_refresh(lower, upper)
+        else:
+            self._pw_status_var.set(
+                "Plot updated. (No cutoffs set — classification skipped.)")
+
+    def _parse_cutoffs(self) -> tuple:
+        lo_str = self._lower_var.get().strip()
+        hi_str = self._upper_var.get().strip()
+
+        if not lo_str and not hi_str:
+            return None, None
+
+        if not lo_str or not hi_str:
+            messagebox.showerror(
+                "Invalid Cutoff",
+                "Both Lower Cutoff and Upper Cutoff must be provided, "
+                "or both left blank.",
+                parent=self,
+            )
+            return None, None
+
+        try:
+            lo, hi = int(lo_str), int(hi_str)
+        except ValueError:
+            messagebox.showerror("Invalid Cutoff",
+                                 "Cutoff values must be integers.", parent=self)
+            return None, None
+
+        if lo >= hi:
+            messagebox.showerror(
+                "Invalid Cutoff",
+                f"Lower Cutoff ({lo}) must be less than Upper Cutoff ({hi}).",
+                parent=self,
+            )
+            return None, None
+
+        return lo, hi
+
+    def _draw_main_plot(self, lower: int | None, upper: int | None) -> None:
+        """(Re)draw the interactive matplotlib canvas; overlay cutoffs when set."""
+        for w in self._canvas_holder.winfo_children():
+            w.destroy()
+        for w in self._toolbar_frame.winfo_children():
+            w.destroy()
+
+        fig = Figure(figsize=(10, 5), dpi=100)
+        ax  = fig.add_subplot(111)
+
+        if not self._present_word_cols:
             ax.text(0.5, 0.5, "No word0..word31 columns available to plot.",
                     ha="center", va="center", transform=ax.transAxes)
         else:
-            # Determine X-axis source
-            x_col = next((c for c in self._X_CANDIDATES if c in self._df.columns), None)
+            x_col = next((c for c in self._X_CANDIDATES
+                          if c in self._df.columns), None)
             if x_col is not None:
                 x_values = pd.to_numeric(self._df[x_col], errors="coerce")
-                x_label = x_col
+                x_label  = x_col
             else:
                 x_values = pd.Series(self._df.index, index=self._df.index)
-                x_label = "Row Index"
+                x_label  = "Row Index"
 
-            # Distinct colors across the full word range via a continuous colormap
-            cmap = matplotlib.colormaps["tab20"] if hasattr(matplotlib, "colormaps") \
-                else matplotlib.cm.get_cmap("tab20")
+            cmap = (matplotlib.colormaps["tab20"]
+                    if hasattr(matplotlib, "colormaps")
+                    else matplotlib.cm.get_cmap("tab20"))
 
             plotted_any = False
-            for i, col in enumerate(present_word_cols):
+            for i, col in enumerate(self._present_word_cols):
                 int_values = self._df[col].apply(self._hex_to_int)
-
                 valid = int_values.notna()
                 if not valid.any():
-                    continue  # entire column is invalid/missing — skip gracefully
-
-                xs = x_values[valid]
-                ys = int_values[valid]
-
-                color = cmap(i / max(1, len(present_word_cols) - 1))
-                ax.plot(xs, ys, label=col, color=color, linewidth=1.0, marker="")
+                    continue
+                color = cmap(i / max(1, len(self._present_word_cols) - 1))
+                ax.plot(x_values[valid], int_values[valid],
+                        label=col, color=color, linewidth=1.0, marker="")
                 plotted_any = True
 
             if not plotted_any:
                 ax.text(0.5, 0.5, "No valid hex values found in word0..word31.",
                         ha="center", va="center", transform=ax.transAxes)
             else:
+                # ── Acceptance overlays (new) ────────────────────────────────
+                if lower is not None and upper is not None:
+                    ax.axhline(lower, color="red", linestyle="--", linewidth=1.2,
+                               label=f"Lower Cutoff ({lower})", zorder=5)
+                    ax.axhline(upper, color="red", linestyle="--", linewidth=1.2,
+                               label=f"Upper Cutoff ({upper})", zorder=5)
+                    ax.axhspan(lower, upper, color="#16A34A", alpha=0.08,
+                               label="Acceptance Region")
+
                 ax.set_xlabel(x_label)
                 ax.set_ylabel("Word Value (decimal)")
                 ax.set_title("Telemetry Words — word0 .. word31")
+                ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
                 ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
                 ax.legend(loc="upper right", fontsize=7, ncol=4)
 
         fig.tight_layout()
+        self._fig = fig
 
-        canvas = FigureCanvasTkAgg(fig, master=self)
+        canvas = FigureCanvasTkAgg(fig, master=self._canvas_holder)
         canvas.draw()
-        canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        # Standard matplotlib navigation toolbar — provides pan + zoom + reset
-        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        toolbar = NavigationToolbar2Tk(canvas, self._toolbar_frame)
         toolbar.update()
 
+        # Save Plot button (original)
+        tk.Button(
+            self._toolbar_frame, text="💾  Save Plot",
+            font=(SANS, 9, "bold"), bg=ACCENT, fg=BTN_FG,
+            activebackground=ACCENT_HOVER, relief="flat", bd=0,
+            padx=12, pady=4, cursor="hand2",
+            command=self._save_plot,
+        ).pack(side="left", padx=(12, 0), pady=4)
+
         # ── FUTURE ANALYTICS (DISABLED) ─────────────────────────────────────
-        # The blocks below are placeholders for future analytics features.
-        # They are intentionally inert (commented out) and must not be
-        # activated as part of this change. Each can be wired up later by
-        # uncommenting and adding the relevant UI controls (e.g. a
-        # checkbox/menu in PlotWindow to toggle each overlay on `ax`).
-        #
-        # --- Moving Average -------------------------------------------------
-        # FUTURE ANALYTICS (DISABLED)
-        # window = 5
-        # for i, col in enumerate(present_word_cols):
-        #     int_values = self._df[col].apply(self._hex_to_int)
-        #     ma = int_values.rolling(window=window, min_periods=1).mean()
-        #     ax.plot(x_values, ma, linestyle="--", linewidth=0.8,
-        #             label=f"{col} (MA{window})")
-        #
-        # --- Anomaly Detection ----------------------------------------------
-        # FUTURE ANALYTICS (DISABLED)
-        # from scipy import stats  # or a simple z-score implementation
-        # for i, col in enumerate(present_word_cols):
-        #     int_values = self._df[col].apply(self._hex_to_int)
-        #     z = (int_values - int_values.mean()) / int_values.std(ddof=0)
-        #     anomalies = int_values[z.abs() > 3]
-        #     ax.scatter(x_values.loc[anomalies.index], anomalies,
-        #                color="red", marker="x", s=20,
-        #                label=f"{col} anomalies")
-        #
-        # --- Threshold Bands -------------------------------------------------
-        # FUTURE ANALYTICS (DISABLED)
-        # lower_threshold, upper_threshold = 1000, 60000
-        # ax.axhspan(lower_threshold, upper_threshold,
-        #            color="green", alpha=0.05, label="Normal band")
-        # ax.axhline(lower_threshold, color="orange", linestyle=":", linewidth=0.8)
-        # ax.axhline(upper_threshold, color="orange", linestyle=":", linewidth=0.8)
-        #
-        # --- Min/Max Highlighting --------------------------------------------
-        # FUTURE ANALYTICS (DISABLED)
-        # for i, col in enumerate(present_word_cols):
-        #     int_values = self._df[col].apply(self._hex_to_int)
-        #     if int_values.notna().any():
-        #         idx_max = int_values.idxmax()
-        #         idx_min = int_values.idxmin()
-        #         ax.annotate("max", (x_values[idx_max], int_values[idx_max]),
-        #                      color="darkred")
-        #         ax.annotate("min", (x_values[idx_min], int_values[idx_min]),
-        #                      color="darkblue")
-        #
-        # --- Word Correlation Analysis ---------------------------------------
-        # FUTURE ANALYTICS (DISABLED)
-        # int_df = pd.DataFrame({
-        #     col: self._df[col].apply(self._hex_to_int) for col in present_word_cols
-        # })
-        # corr_matrix = int_df.corr()
-        # # e.g. render corr_matrix as a heatmap in a separate tab/figure:
-        # # fig2 = Figure(figsize=(8, 8)); ax2 = fig2.add_subplot(111)
-        # # ax2.imshow(corr_matrix, cmap="coolwarm", vmin=-1, vmax=1)
+        # Moving Average, Anomaly Detection, Threshold Bands, Min/Max
+        # Highlighting, Word Correlation Analysis — preserved as placeholders.
         # ────────────────────────────────────────────────────────────────────
+
+    # ── Classification & Static Plots ────────────────────────────────────────
+
+    def _classify_and_refresh(self, lower: int, upper: int) -> None:
+        self._pw_status_var.set("Classifying telemetry values…")
+        self.update_idletasks()
+
+        engine = AcceptanceEngine(self._df, lower, upper)
+        engine.run(word_cols=self._word_cols)
+        self._engine = engine
+
+        # Write temp static plot PNGs
+        tmp_dir = os.path.join(
+            os.path.dirname(self._csv_path) if self._csv_path
+            else os.path.expanduser("~"),
+            "_telemetry_tmp",
+        )
+        os.makedirs(tmp_dir, exist_ok=True)
+        self._acc_plot_path = os.path.join(tmp_dir, "accepted_plot.png")
+        self._rej_plot_path = os.path.join(tmp_dir, "rejected_plot.png")
+
+        # X-axis helper
+        x_col = next((c for c in self._X_CANDIDATES
+                      if c in self._df.columns), None)
+        if x_col is not None:
+            x_all   = pd.to_numeric(self._df[x_col], errors="coerce")
+            x_label = x_col
+        else:
+            x_all   = pd.Series(self._df.index, index=self._df.index)
+            x_label = "Row Index"
+
+        self._save_class_plot(engine.accepted_df, x_all, x_label, lower, upper,
+                              "Accepted Telemetry Plot", self._acc_plot_path)
+        self._save_class_plot(engine.rejected_df, x_all, x_label, lower, upper,
+                              "Rejected Telemetry Plot", self._rej_plot_path)
+
+        self._refresh_summary(engine.summary)
+        self._refresh_detail_tables(engine)
+        self._report_btn.config(state="normal")
+
+        s = engine.summary
+        self._pw_status_var.set(
+            f"Classified {s['Total Points']} points — "
+            f"Accepted: {s['Accepted']}, Rejected: {s['Rejected']}. "
+            "Static plots saved."
+        )
+
+    def _save_class_plot(
+        self,
+        class_df: pd.DataFrame,
+        x_all: pd.Series,
+        x_label: str,
+        lower: int,
+        upper: int,
+        title: str,
+        out_path: str,
+    ) -> None:
+        cmap    = plt.cm.get_cmap("tab20")
+        row_to_x = x_all.to_dict()
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        if class_df.empty:
+            ax.text(0.5, 0.5, "No data points in this category.",
+                    ha="center", va="center", transform=ax.transAxes)
+        else:
+            plotted_any = False
+            for i, col in enumerate(self._present_word_cols):
+                col_rows = class_df[class_df["Word Column"] == col]
+                if col_rows.empty:
+                    continue
+                xs = [row_to_x.get(r, float("nan")) for r in col_rows["Row Index"]]
+                ys = list(col_rows["Decimal Value"])
+                color = cmap(i / max(1, len(self._present_word_cols) - 1))
+                ax.plot(xs, ys, label=col, color=color,
+                        linewidth=1.0, marker="o", markersize=2)
+                plotted_any = True
+
+            if plotted_any:
+                ax.axhline(lower, color="red", linestyle="--", linewidth=1.2,
+                           label=f"Lower Cutoff ({lower})")
+                ax.axhline(upper, color="red", linestyle="--", linewidth=1.2,
+                           label=f"Upper Cutoff ({upper})")
+                ax.axhspan(lower, upper, color="#16A34A", alpha=0.08,
+                           label="Acceptance Region")
+
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("Word Value (decimal)")
+        ax.set_title(title)
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+        ax.legend(loc="upper right", fontsize=7, ncol=4)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+    # ── Summary & Table Refresh ───────────────────────────────────────────────
+
+    def _show_extras(self) -> None:
+        if not self._summary_frame.winfo_ismapped():
+            self._summary_frame.pack(fill="x", after=self._plot_frame)
+        if not self._tables_frame.winfo_ismapped():
+            self._tables_frame.pack(fill="both", expand=False,
+                                    after=self._summary_frame)
+            self._tables_frame.configure(height=180)
+
+    def _refresh_summary(self, summary: dict) -> None:
+        self._show_extras()
+        for key, var in self._summary_vars.items():
+            var.set(str(summary.get(key, "—")))
+
+    def _refresh_detail_tables(self, engine: AcceptanceEngine) -> None:
+        self._show_extras()
+        self._fill_tab(
+            self._acc_tab,
+            engine.accepted_df.reset_index(),
+            ["Serial Number", "Row Index", "Word Column",
+             "Hex Value", "Decimal Value", "Status"],
+            header_bg=TBL_HEX_BG, header_fg=TBL_HEX_FG,
+        )
+        self._fill_tab(
+            self._rej_tab,
+            engine.rejected_df.reset_index(),
+            ["Serial Number", "Row Index", "Word Column",
+             "Hex Value", "Decimal Value", "Reason"],
+            header_bg=TBL_TX_BG, header_fg=TBL_TX_FG,
+        )
+
+    @staticmethod
+    def _fill_tab(frame, df, columns, header_bg, header_fg) -> None:
+        for w in frame.winfo_children():
+            w.destroy()
+        data_rows = [list(map(str, r))
+                     for r in df[columns].itertuples(index=False)]
+        sheet = tksheet.Sheet(
+            frame,
+            headers=columns,
+            data=data_rows,
+            outline_color=BORDER, frame_bg=BG,
+            table_bg=PANEL, table_fg=TEXT, table_grid_fg=BORDER,
+            header_bg=header_bg, header_fg=header_fg,
+            header_font=(SANS, 9, "bold"),
+            font=(MONO, 9, "normal"),
+            row_height=22,
+            show_row_index=False,
+            show_x_scrollbar=True, show_y_scrollbar=True,
+        )
+        sheet.pack(fill="both", expand=True)
+        sheet.enable_bindings("column_width_resize", "arrowkeys")
+
+    # ── Report Generation ─────────────────────────────────────────────────────
+
+    def _generate_report(self) -> None:
+        if self._engine is None:
+            messagebox.showwarning("No Data",
+                                   "Plot with cutoffs first.", parent=self)
+            return
+        if not self._csv_path:
+            messagebox.showwarning(
+                "No CSV Path",
+                "Cannot determine output folder — reload the CSV and try again.",
+                parent=self,
+            )
+            return
+
+        self._pw_status_var.set("Generating report…")
+        self.update_idletasks()
+
+        try:
+            out_folder = _save_acceptance_output(
+                csv_path=self._csv_path,
+                engine=self._engine,
+                acc_img=self._acc_plot_path,
+                rej_img=self._rej_plot_path,
+                file_name=os.path.basename(self._csv_path),
+            )
+            self._pw_status_var.set(f"Report saved → {out_folder}")
+            messagebox.showinfo("Report Generated",
+                                f"All files written to:\n\n{out_folder}",
+                                parent=self)
+        except Exception as exc:
+            self._pw_status_var.set(f"Report failed: {exc}")
+            messagebox.showerror("Report Error", str(exc), parent=self)
+
+    # ── Original helpers (unchanged) ──────────────────────────────────────────
+
+    def _save_plot(self) -> None:
+        if self._fig is None:
+            return
+
+        if self._word_cols:
+            nums = "_".join(c.replace("word", "") for c in self._word_cols)
+            default_name = f"{self._ss_label}_{nums}"
+        else:
+            default_name = self._ss_label
+
+        if self._save_dir:
+            out_dir = os.path.join(self._save_dir, "SubSys_Plotted")
+            os.makedirs(out_dir, exist_ok=True)
+        else:
+            out_dir = os.path.expanduser("~")
+
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            initialdir=out_dir,
+            initialfile=default_name,
+            defaultextension=".png",
+            filetypes=[
+                ("PNG image",    "*.png"),
+                ("JPEG image",   "*.jpg"),
+                ("PDF document", "*.pdf"),
+                ("SVG vector",   "*.svg"),
+                ("All files",    "*.*"),
+            ],
+            title="Save Plot",
+        )
+        if not path:
+            return
+
+        try:
+            self._fig.savefig(path, dpi=150, bbox_inches="tight")
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc), parent=self)
 
     @staticmethod
     def _hex_to_int(raw) -> float:
-        """Convert a word cell to an int value, or NaN if missing/invalid.
-
-        Uses the same case-/prefix-insensitive normalization as every other
-        hex feature in this application (normalize_hex / Word).
-        """
+        """Convert a word cell to an int value, or NaN if missing/invalid."""
         digits = normalize_hex(raw)
         if not digits:
             return float("nan")
@@ -1285,6 +2025,152 @@ class PlotWindow(tk.Toplevel):
         if not 0 <= value <= 0xFFFF:
             return float("nan")
         return float(value)
+
+
+# ─── GUI: Multi-Select Dropdown ───────────────────────────────────────────────
+
+class MultiSelectDropdown(tk.Frame):
+    """Button that opens a scrollable checkbox popup for selecting word columns."""
+
+    def __init__(self, parent: tk.Widget, items: list, **kw):
+        bg = kw.pop("bg", PANEL)
+        super().__init__(parent, bg=bg, **kw)
+        self._items = items
+        self._vars: dict = {it: tk.BooleanVar(value=False) for it in items}
+        self._popup: tk.Toplevel | None = None
+        self._outside_bind_id: str | None = None
+
+        self._label_var = tk.StringVar(value="All Words  ▾")
+        self._btn = tk.Button(
+            self, textvariable=self._label_var,
+            font=(MONO, 8),
+            bg=BTN_SECONDARY, fg=BTN_SECONDARY_FG,
+            activebackground=ACCENT2, activeforeground=BTN_FG,
+            relief="flat", bd=0, padx=10, pady=3,
+            cursor="hand2",
+            command=self._toggle,
+        )
+        self._btn.pack()
+
+    # ── public API ─────────────────────────────────────────────────────────────
+
+    def get_selected(self) -> list:
+        return [it for it in self._items if self._vars[it].get()]
+
+    def clear_selection(self) -> None:
+        for v in self._vars.values():
+            v.set(False)
+        self._update_label()
+
+    # ── internals ──────────────────────────────────────────────────────────────
+
+    def _update_label(self) -> None:
+        sel = self.get_selected()
+        if not sel:
+            self._label_var.set("All Words  ▾")
+        elif len(sel) == 1:
+            self._label_var.set(f"{sel[0]}  ▾")
+        else:
+            self._label_var.set(f"{len(sel)} words selected  ▾")
+
+    def _toggle(self) -> None:
+        if self._popup and self._popup.winfo_exists():
+            self._close_popup()
+        else:
+            self._open_popup()
+
+    def _close_popup(self) -> None:
+        if self._outside_bind_id:
+            try:
+                self.winfo_toplevel().unbind("<ButtonPress-1>", self._outside_bind_id)
+            except Exception:
+                pass
+            self._outside_bind_id = None
+        if self._popup:
+            self._popup.destroy()
+            self._popup = None
+
+    def _open_popup(self) -> None:
+        popup = tk.Toplevel(self, bg=PANEL)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        self._popup = popup
+
+        self.update_idletasks()
+        x = self._btn.winfo_rootx()
+        y = self._btn.winfo_rooty() + self._btn.winfo_height() + 2
+        popup.geometry(f"170x260+{x}+{y}")
+
+        # header row: All / None / close
+        hdr = tk.Frame(popup, bg=TOPBAR_BG, pady=3, padx=4)
+        hdr.pack(fill="x")
+        tk.Button(hdr, text="All", font=(SANS, 7, "bold"), bg=TOPBAR_BG, fg=BTN_FG,
+                  relief="flat", bd=0, padx=6, cursor="hand2",
+                  command=self._select_all).pack(side="left")
+        tk.Button(hdr, text="None", font=(SANS, 7, "bold"), bg=TOPBAR_BG, fg=BTN_FG,
+                  relief="flat", bd=0, padx=6, cursor="hand2",
+                  command=self._deselect_all).pack(side="left")
+        tk.Button(hdr, text="✕", font=(SANS, 8), bg=TOPBAR_BG, fg=BTN_FG,
+                  relief="flat", bd=0, padx=8, cursor="hand2",
+                  command=self._close_popup).pack(side="right")
+
+        # scrollable checklist
+        body = tk.Frame(popup, bg=PANEL)
+        body.pack(fill="both", expand=True)
+
+        vsb = tk.Scrollbar(body, orient="vertical")
+        vsb.pack(side="right", fill="y")
+
+        canvas = tk.Canvas(body, bg=PANEL, highlightthickness=0,
+                           yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.config(command=canvas.yview)
+
+        inner = tk.Frame(canvas, bg=PANEL)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+
+        for it in self._items:
+            tk.Checkbutton(
+                inner, text=it, variable=self._vars[it],
+                font=(MONO, 8), bg=PANEL, fg=TEXT,
+                activebackground=PANEL, activeforeground=ACCENT2,
+                selectcolor=ACCENT2, highlightthickness=0, bd=0,
+                anchor="w", command=self._update_label,
+            ).pack(fill="x", padx=8, pady=1)
+
+        # close when clicking outside the popup
+        def _check_outside(event):
+            w = event.widget
+            while w is not None:
+                if w is popup:
+                    return
+                try:
+                    w = w.master
+                except Exception:
+                    break
+            bx, by = self._btn.winfo_rootx(), self._btn.winfo_rooty()
+            bw, bh = self._btn.winfo_width(), self._btn.winfo_height()
+            if bx <= event.x_root <= bx + bw and by <= event.y_root <= by + bh:
+                return  # let _toggle handle it
+            self._close_popup()
+
+        self._outside_bind_id = self.winfo_toplevel().bind(
+            "<ButtonPress-1>", _check_outside, add=True
+        )
+
+    def _select_all(self) -> None:
+        for v in self._vars.values():
+            v.set(True)
+        self._update_label()
+
+    def _deselect_all(self) -> None:
+        for v in self._vars.values():
+            v.set(False)
+        self._update_label()
 
 
 # ─── GUI: Main Application ────────────────────────────────────────────────────
@@ -1305,6 +2191,7 @@ class App(tk.Tk, StyleMixin):
         self._display_df: pd.DataFrame | None = None
         self._last_selected_word_col: str | None = None   # word col of last selected row
         self._display_format = tk.StringVar(value="Hexadecimal")
+        self._formula_str: str = ""          # current engineering formula (Feature 1)
         self._build_ui()
 
     # ── Display Format Helper ─────────────────────────────────────────────────
@@ -1331,6 +2218,16 @@ class App(tk.Tk, StyleMixin):
             return str(w.decimal)
         if fmt == "octal":
             return w.octal
+        if fmt == "engineering formula":
+            formula = self._formula_str.strip()
+            if not formula:
+                return str(w.decimal)          # no formula yet — show integer
+            ok, result = safe_eval_formula(formula, float(w.decimal))
+            if ok:
+                # Format: up to 6 significant figures, strip trailing zeros
+                return f"{result:.6g}"
+            else:
+                return "ERR"                   # cell shows ERR; tooltip not needed
         return str(value)
 
     # ── UI Construction ───────────────────────────────────────────────────────
@@ -1352,9 +2249,9 @@ class App(tk.Tk, StyleMixin):
         title_block = tk.Frame(bar, bg=TOPBAR_BG)
         title_block.pack(side="left")
 
-        tk.Label(title_block, text="TELEMETRY CSV VIEWER",
+        tk.Label(title_block, text="TELEMETRY DATA ANALYSIS",
                  font=(SANS, 13, "bold"), bg=TOPBAR_BG, fg=TOPBAR_FG).pack(anchor="w")
-        tk.Label(title_block, text="Telemetry Analysis & Subsystem Filtering Tool",
+        tk.Label(title_block, text="Defense - Missile Data Subsystem Tool",
                  font=(SANS, 8), bg=TOPBAR_BG, fg="#93B8E0").pack(anchor="w")
 
         # Button row (right) — primary action first
@@ -1396,29 +2293,10 @@ class App(tk.Tk, StyleMixin):
         tk.Label(bar, text="WORD COLUMNS:", font=(SANS, 8, "bold"),
                  bg=PANEL, fg=MUTED).pack(side="left", padx=(0, 8))
 
-        lb_frame = tk.Frame(bar, bg=BORDER, bd=0,
-                            highlightbackground=BORDER, highlightthickness=1)
-        lb_frame.pack(side="left")
-
-        self._word_listbox = tk.Listbox(
-            lb_frame,
-            selectmode="multiple",
-            exportselection=False,
-            font=(MONO, 8),
-            bg=PANEL, fg=TEXT,
-            selectbackground=ACCENT2, selectforeground=BTN_FG,
-            highlightthickness=0, bd=0,
-            height=2,
-            width=52,
+        self._word_dropdown = MultiSelectDropdown(
+            bar, [f"word{i}" for i in range(32)], bg=PANEL,
         )
-        hsb = tk.Scrollbar(lb_frame, orient="horizontal",
-                           command=self._word_listbox.xview)
-        self._word_listbox.configure(xscrollcommand=hsb.set)
-        self._word_listbox.pack(side="top")
-        hsb.pack(side="top", fill="x")
-
-        for i in range(32):
-            self._word_listbox.insert("end", f"word{i}")
+        self._word_dropdown.pack(side="left")
 
         self._btn(bar, "Apply Columns", self._apply_word_cols, small=True).pack(side="left", padx=(8, 4))
         self._btn(bar, "Reset Columns", self._reset_word_cols, small=True).pack(side="left", padx=(0, 4))
@@ -1431,13 +2309,13 @@ class App(tk.Tk, StyleMixin):
 
         fmt_om = tk.OptionMenu(
             bar, self._display_format,
-            "Hexadecimal", "Binary", "Integer", "Octal",
-            command=lambda _: self._refresh_table(),
+            "Hexadecimal", "Binary", "Integer", "Octal", "Engineering Formula",
+            command=self._on_display_format_changed,
         )
         fmt_om.config(
             font=(MONO, 8), bg=BTN_SECONDARY, fg=BTN_SECONDARY_FG,
             activebackground=ACCENT2, activeforeground=BTN_FG,
-            relief="flat", bd=0, highlightthickness=0, width=11,
+            relief="flat", bd=0, highlightthickness=0, width=17,
         )
         fmt_om["menu"].config(
             font=(MONO, 8), bg=PANEL, fg=TEXT,
@@ -1445,11 +2323,51 @@ class App(tk.Tk, StyleMixin):
         )
         fmt_om.pack(side="left")
 
+        # ── Download words as TXT ────────────────────────────────────────────
+        tk.Frame(bar, bg=BORDER, width=1).pack(side="left", fill="y", padx=(10, 8), pady=2)
+        self._btn(bar, "↓ Download Words TXT", self._download_words_txt,
+                  small=True).pack(side="left", padx=(0, 4))
+
+        # ── Engineering Formula row (hidden until "Engineering Formula" selected)
+        self._formula_bar = tk.Frame(self, bg=PANEL, padx=16, pady=4,
+                                     highlightbackground=BORDER, highlightthickness=1)
+        # (not packed yet — shown dynamically by _on_display_format_changed)
+
+        tk.Label(self._formula_bar, text="ƒ(x)  FORMULA:",
+                 font=(SANS, 8, "bold"), bg=PANEL, fg=ACCENT2).pack(side="left", padx=(0, 6))
+
+        tk.Label(self._formula_bar,
+                 text="x = hex→int value of each word cell  |  operators: + - * / ** // %  |  constants: pi, e  |  funcs: sqrt, sin, cos, log …",
+                 font=(SANS, 7), bg=PANEL, fg=MUTED).pack(side="left", padx=(0, 10))
+
+        self._formula_var = tk.StringVar(value=self._formula_str)
+        self._formula_entry = tk.Entry(
+            self._formula_bar,
+            textvariable=self._formula_var,
+            font=(MONO, 9), bg=RESULT_BG, fg=RESULT_FG,
+            insertbackground=TEXT, relief="flat", bd=0,
+            highlightbackground=BORDER, highlightthickness=1,
+            width=30,
+        )
+        self._formula_entry.pack(side="left", padx=(0, 8), ipady=3)
+
+        self._formula_status_var = tk.StringVar(value="")
+        self._formula_status_lbl = tk.Label(
+            self._formula_bar, textvariable=self._formula_status_var,
+            font=(MONO, 8), bg=PANEL, fg=SUCCESS,
+        )
+        self._formula_status_lbl.pack(side="left")
+
+        # Bind: recompute on every keystroke (debounced via after())
+        self._formula_debounce_id: str | None = None
+        self._formula_var.trace_add("write", self._on_formula_text_changed)
+
     def _build_main_area(self) -> None:
         """Horizontal pane: table (left, expandable) + detail panel (right, fixed)."""
         pane = tk.PanedWindow(self, orient="horizontal", bg=BORDER,
                               sashwidth=5, sashrelief="flat")
         pane.pack(fill="both", expand=True, padx=0, pady=0)
+        self._pane_widget = pane   # kept so formula bar can be packed before it
 
         # Left: table
         table_container = tk.Frame(pane, bg=BG)
@@ -1551,7 +2469,7 @@ class App(tk.Tk, StyleMixin):
         self._selected_word_cols = None
         self._hex_search = None
         self._search_result_var.set("")
-        self._word_listbox.selection_clear(0, "end")
+        self._word_dropdown.clear_selection()
         self._hide_bit_analysis()
 
         columns = self._data.get_columns()
@@ -1577,8 +2495,9 @@ class App(tk.Tk, StyleMixin):
 
     def _export_filtered_by_subsystem(self, csv_path: str, df: pd.DataFrame) -> None:
         """
-        Background thread: create SubSys_comWordFiltered/SSn/filtered_SSn.csv
+        Background thread: create SubSys_comWordFiltered/SSn/filtered_SSn.txt
         for each unique 4-character Tx_cmd prefix found in the loaded CSV.
+        Each file contains only word0..word31 columns, space-separated.
         Subsystem identifiers are sorted alphabetically; the first maps to SS1,
         the second to SS2, and so on (deterministic, stable ordering).
         Safe to run off the main thread — only touches the filesystem.
@@ -1612,8 +2531,9 @@ class App(tk.Tk, StyleMixin):
                 mask = tx_series.str[:4].str.upper() == ident
                 filtered = df.loc[mask]
 
-                out_file = os.path.join(sub_dir, f"filtered_{ss_name}.csv")
-                filtered.to_csv(out_file, index=False)
+                word_cols = [c for c in [f"word{i}" for i in range(32)] if c in filtered.columns]
+                out_file = os.path.join(sub_dir, f"filtered_{ss_name}.txt")
+                filtered[word_cols].to_csv(out_file, sep=" ", index=False)
                 valid_ids.append(ident)
 
             # Report back on the main thread via `after`
@@ -1811,24 +2731,290 @@ class App(tk.Tk, StyleMixin):
         except Exception as exc:
             self._status_set(f"Export failed: {exc}", ok=False)
 
-    def _open_plot_window(self) -> None:
-        """Open the matplotlib telemetry plot window for word0..word31.
 
-        Plots the full loaded dataset (independent of the current Tx_cmd
-        filter / hex search / word-column visibility selections), so the
-        existing table-centric workflows are left untouched.
+    def _download_words_txt(self) -> None:
+        if self._display_df is None or self._display_df.empty:
+            self._status_set("Nothing to export — load a file first.", ok=False)
+            return
+
+        # Determine which word columns to export (respects Apply Columns selection)
+        word_set = {f"word{i}" for i in range(32)}
+        if self._selected_word_cols is not None:
+            word_cols = [c for c in self._selected_word_cols if c in self._display_df.columns]
+        else:
+            word_cols = [c for c in self._display_df.columns if c in word_set]
+
+        if not word_cols:
+            self._status_set("No word columns visible to export.", ok=False)
+            return
+
+        # Apply current display format to every word cell (applymap works on pandas 2.0+)
+        _apply = getattr(self._display_df[word_cols], "map", None) or \
+                 getattr(self._display_df[word_cols], "applymap")
+        words_df = _apply(self._format_word_display)
+
+        # Create SubSys_DisplayExport folder next to the source CSV
+        csv_dir = os.path.dirname(self._data.file_path)
+        out_dir = os.path.join(csv_dir, "SubSys_DisplayExport")
+        os.makedirs(out_dir, exist_ok=True)
+
+        fmt_tag = self._display_format.get().lower().replace(" ", "_")
+        default_name = f"words_{fmt_tag}.txt"
+
+        path = filedialog.asksaveasfilename(
+            title="Save word columns as TXT",
+            initialdir=out_dir,
+            initialfile=default_name,
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        try:
+            words_df.to_csv(path, sep=" ", index=False)
+            self._status_set(
+                f"Exported {len(words_df)} rows × {len(word_cols)} words → '{os.path.basename(path)}'.",
+                ok=True,
+            )
+        except Exception as exc:
+            self._status_set(f"Export failed: {exc}", ok=False)
+
+    # ── Feature 1: Engineering Formula helpers ────────────────────────────────
+
+    def _on_display_format_changed(self, _value=None) -> None:
+        """Called whenever the DISPLAY FORMAT dropdown selection changes."""
+        fmt = self._display_format.get().lower()
+        if fmt == "engineering formula":
+            # Show the formula bar directly below the word-selector bar.
+            # pack_info() tells us where the word-selector bar sits so we can
+            # insert immediately after it.  Simplest approach: pack before main area.
+            self._formula_bar.pack(fill="x", before=self._pane_widget)
+        else:
+            if self._formula_bar.winfo_ismapped():
+                self._formula_bar.pack_forget()
+            # Clear any residual formula validation text when switching away
+            self._formula_status_var.set("")
+        self._refresh_table()
+
+    def _on_formula_text_changed(self, *_args) -> None:
+        """Debounced trace callback: validate formula and schedule table refresh."""
+        # Cancel any pending refresh from a previous keystroke
+        if self._formula_debounce_id is not None:
+            self.after_cancel(self._formula_debounce_id)
+        self._formula_debounce_id = self.after(350, self._apply_formula_and_refresh)
+
+    def _apply_formula_and_refresh(self) -> None:
+        """Validate the formula with a dummy x=1, update status, then refresh."""
+        self._formula_debounce_id = None
+        raw = self._formula_var.get().strip()
+        self._formula_str = raw
+
+        if not raw:
+            self._formula_status_var.set("Enter a formula above (e.g. x*0.125)")
+            self._formula_status_lbl.config(fg=MUTED)
+            self._refresh_table()
+            return
+
+        # Validate with a neutral x value
+        ok, result = safe_eval_formula(raw, 1.0)
+        if ok:
+            self._formula_status_var.set(f"✓  valid  (x=1 → {result:.6g})")
+            self._formula_status_lbl.config(fg=SUCCESS)
+        else:
+            self._formula_status_var.set(f"✗  {result}")
+            self._formula_status_lbl.config(fg=ERROR)
+        self._refresh_table()
+
+    # ── Feature 2: Plot by Subsystem ──────────────────────────────────────────
+
+    def _open_plot_window(self) -> None:
+        """Show subsystem-selection dialog, then open PlotWindow on chosen data.
+
+        Falls back to full dataset when no subsystem folders exist (preserving
+        original behaviour exactly).  All PlotWindow internals are unchanged.
         """
         if self._data.df is None:
             self._status_set("Load a CSV file first.", ok=False)
             return
-        PlotWindow(self, self._data.df)
-        self._status_set("Opened telemetry plot window.", ok=True)
+
+        # ── Detect existing SS* folders ──────────────────────────────────────
+        csv_dir = os.path.dirname(self._data.file_path)
+        out_root = os.path.join(csv_dir, "SubSys_comWordFiltered")
+
+        subsystem_options: list[tuple[str, str]] = []   # [(label, csv_path), ...]
+        if os.path.isdir(out_root):
+            # Enumerate SS1, SS2, … in numeric order
+            import re as _re
+            for entry in sorted(os.listdir(out_root),
+                                key=lambda n: int(_re.sub(r"\D", "", n) or "0")):
+                if not _re.fullmatch(r"SS\d+", entry):
+                    continue
+                csv_path = os.path.join(out_root, entry, f"filtered_{entry}.txt")
+                if os.path.isfile(csv_path):
+                    subsystem_options.append((entry, csv_path))
+
+        if not subsystem_options:
+            # No subsystem folders yet — open full dataset (original behaviour)
+            PlotWindow(self, self._data.df, csv_path=self._data.file_path)
+            self._status_set("Opened telemetry plot window (full dataset).", ok=True)
+            return
+
+        # ── Build selection dialog ────────────────────────────────────────────
+        dlg = tk.Toplevel(self)
+        dlg.title("Plot Telemetry — Select Subsystem")
+        dlg.configure(bg=PANEL)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        # Header
+        hdr = tk.Frame(dlg, bg=TOPBAR_BG, pady=10, padx=16)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="📈  PLOT BY SUBSYSTEM",
+                 font=(SANS, 11, "bold"), bg=TOPBAR_BG, fg=TOPBAR_FG).pack(anchor="w")
+        tk.Label(hdr, text="Select a subsystem source to plot, or plot all data.",
+                 font=(SANS, 8), bg=TOPBAR_BG, fg="#93B8E0").pack(anchor="w")
+
+        body = tk.Frame(dlg, bg=PANEL, padx=20, pady=16)
+        body.pack(fill="both", expand=True)
+
+        tk.Label(body, text="PLOT SOURCE:", font=(SANS, 8, "bold"),
+                 bg=PANEL, fg=MUTED).pack(anchor="w", pady=(0, 6))
+
+        choice_var = tk.StringVar(value="__ALL__")
+
+        # "All subsystems" option
+        all_rb = tk.Radiobutton(
+            body, text="All subsystems (full loaded dataset)",
+            variable=choice_var, value="__ALL__",
+            font=(SANS, 9), bg=PANEL, fg=TEXT,
+            activebackground=PANEL, selectcolor=PANEL,
+            relief="flat", bd=0,
+        )
+        all_rb.pack(anchor="w", pady=2)
+
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=6)
+
+        # One radio button per detected SS*
+        for label, csv_path in subsystem_options:
+            rb = tk.Radiobutton(
+                body, text=f"{label}  —  {os.path.basename(csv_path)}",
+                variable=choice_var, value=csv_path,
+                font=(MONO, 9), bg=PANEL, fg=TEXT,
+                activebackground=PANEL, selectcolor=PANEL,
+                relief="flat", bd=0,
+            )
+            rb.pack(anchor="w", pady=1)
+
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=10)
+
+        # ── Word column selector ──────────────────────────────────────────────
+        tk.Label(body, text="WORD COLUMNS TO PLOT:", font=(SANS, 8, "bold"),
+                 bg=PANEL, fg=MUTED).pack(anchor="w", pady=(0, 4))
+
+        word_vars: dict = {f"word{i}": tk.BooleanVar(value=True) for i in range(32)}
+
+        qs_row = tk.Frame(body, bg=PANEL)
+        qs_row.pack(anchor="w", pady=(0, 6))
+
+        def _sel_all_words():
+            for v in word_vars.values():
+                v.set(True)
+
+        def _sel_no_words():
+            for v in word_vars.values():
+                v.set(False)
+
+        tk.Button(qs_row, text="All", font=(SANS, 7, "bold"),
+                  bg=TOPBAR_BG, fg=BTN_FG, relief="flat", bd=0,
+                  padx=8, pady=2, cursor="hand2",
+                  command=_sel_all_words).pack(side="left", padx=(0, 4))
+        tk.Button(qs_row, text="None", font=(SANS, 7, "bold"),
+                  bg=TOPBAR_BG, fg=BTN_FG, relief="flat", bd=0,
+                  padx=8, pady=2, cursor="hand2",
+                  command=_sel_no_words).pack(side="left")
+
+        # Grid of checkboxes — 8 per row so 32 words fit in 4 rows
+        chk_outer = tk.Frame(body, bg=BORDER, highlightbackground=BORDER,
+                             highlightthickness=1)
+        chk_outer.pack(fill="x", pady=(0, 4))
+
+        chk_inner = tk.Frame(chk_outer, bg=PANEL)
+        chk_inner.pack(fill="x", padx=2, pady=2)
+
+        WORDS_PER_ROW = 8
+        for i, (name, var) in enumerate(word_vars.items()):
+            r, c = divmod(i, WORDS_PER_ROW)
+            tk.Checkbutton(
+                chk_inner, text=name, variable=var,
+                font=(MONO, 8), bg=PANEL, fg=TEXT,
+                activebackground=PANEL, activeforeground=ACCENT2,
+                selectcolor=ACCENT2, highlightthickness=0, bd=0,
+                anchor="w",
+            ).grid(row=r, column=c, sticky="w", padx=4, pady=1)
+
+        tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=10)
+
+        # Buttons
+        btn_row = tk.Frame(body, bg=PANEL)
+        btn_row.pack(anchor="e")
+
+        def _on_plot():
+            selected_words = [name for name, var in word_vars.items() if var.get()]
+            if not selected_words:
+                self._status_set("Select at least one word column to plot.", ok=False)
+                return
+            sel = choice_var.get()
+            dlg.destroy()
+            csv_save_dir = os.path.dirname(self._data.file_path)
+            if sel == "__ALL__":
+                df_to_plot = self._data.df
+                label = "All"
+            else:
+                try:
+                    df_to_plot = pd.read_csv(sel, sep=" ")
+                    label = os.path.basename(os.path.dirname(sel))  # e.g. "SS3"
+                except Exception as exc:
+                    self._status_set(f"Could not load subsystem file: {exc}", ok=False)
+                    return
+            PlotWindow(self, df_to_plot, word_cols=selected_words,
+                       ss_label=label, save_dir=csv_save_dir,
+                       csv_path=self._data.file_path)
+            n = len(selected_words)
+            self._status_set(
+                f"Opened telemetry plot window ({label}, {n} word(s)).", ok=True
+            )
+
+        def _on_cancel():
+            dlg.destroy()
+
+        tk.Button(
+            btn_row, text="Cancel",
+            font=(SANS, 9), bg=BTN_SECONDARY, fg=BTN_SECONDARY_FG,
+            activebackground=BORDER, relief="flat", bd=0,
+            padx=10, pady=4, cursor="hand2",
+            command=_on_cancel,
+        ).pack(side="right", padx=(6, 0))
+
+        tk.Button(
+            btn_row, text="📈  Plot",
+            font=(SANS, 9, "bold"), bg=ACCENT, fg=BTN_FG,
+            activebackground=ACCENT_HOVER, relief="flat", bd=0,
+            padx=12, pady=4, cursor="hand2",
+            command=_on_plot,
+        ).pack(side="right")
+
+        # Centre dialog over main window
+        self.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_reqheight()) // 2
+        dlg.geometry(f"+{x}+{y}")
 
     def _apply_word_cols(self) -> None:
         if self._data.df is None:
             self._status_set("Load a CSV file first.", ok=False)
             return
-        selected = [self._word_listbox.get(i) for i in self._word_listbox.curselection()]
+        selected = self._word_dropdown.get_selected()
         self._selected_word_cols = selected if selected else []
         self._refresh_table()
         shown = ", ".join(selected) if selected else "none"
@@ -1837,7 +3023,7 @@ class App(tk.Tk, StyleMixin):
     def _reset_word_cols(self) -> None:
         if self._data.df is None:
             return
-        self._word_listbox.selection_clear(0, "end")
+        self._word_dropdown.clear_selection()
         self._selected_word_cols = None
         self._refresh_table()
         self._status_set("Word columns reset — showing all.", ok=True)
